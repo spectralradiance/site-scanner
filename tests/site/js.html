@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A page whose title, content and links are all added by JavaScript after load.">
+  <meta property="og:image" content="/logo.png">
+</head>
+<body>
+  <main>
+    <h1>Client-side page</h1>
+    <div id="app"></div>
+    <form><input type="text" name="email"></form>
+  </main>
+  <script>
+    document.title = "JavaScript rendered page - Acme Widgets";
+    const words = [];
+    for (let i = 0; i < 40; i++) words.push("Our widgets are built to last and tested by hand.");
+    document.getElementById("app").innerHTML =
+      "<p>" + words.join(" ") + "</p><p><a href='/js-only-target.html'>New arrivals</a></p>";
+    fetch("/api/missing.json").catch(() => {});
+    console.error("custom failure from test page");
+    setTimeout(() => { throw new Error("boom from test page"); }, 0);
+  </script>
+</body>
+</html>

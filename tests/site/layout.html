@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Layout problems test page - Acme Widgets</title>
+  <meta name="description" content="A page with a wide element, tiny buttons, tiny text and badly sized images for testing.">
+  <meta property="og:image" content="/logo.png">
+  <style>
+    .wide-table { width: 900px; background: #eee; }
+    .tiny-btn { width: 16px; height: 16px; padding: 0; border: 0; }
+    .fineprint { font-size: 9px; }
+    .thumb { width: 100px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Layout</h1>
+    <div class="wide-table">This block is far wider than a phone screen.</div>
+    <button class="tiny-btn" aria-label="Close">x</button>
+    <p class="fineprint">Terms and conditions apply to all widget purchases.</p>
+    <img class="thumb" src="/assets/big.png" alt="Big image shown small">
+    <div style="height: 3000px"></div>
+    <img src="/logo.png" alt="Logo far down the page" width="4" height="4">
+  </main>
+</body>
+</html>

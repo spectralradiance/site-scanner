@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Performance problems test page - Acme Widgets</title>
+  <meta name="description" content="A page with render-blocking CSS, heavy JavaScript, a large image and a layout shift.">
+  <meta property="og:image" content="/logo.png">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main>
+    <h1>Performance</h1>
+    <img src="/assets/big.png" alt="Large hero image" width="500" height="500">
+    <p id="intro">This paragraph gets pushed down when a banner is inserted above it.</p>
+  </main>
+  <script src="/assets/heavy.js"></script>
+  <script>
+    setTimeout(() => {
+      const banner = document.createElement("div");
+      banner.className = "promo-banner";
+      banner.style.height = "300px";
+      banner.textContent = "Late promo banner";
+      document.body.insertBefore(banner, document.body.firstChild);
+    }, 400);
+  </script>
+</body>
+</html>

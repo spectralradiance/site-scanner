@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "site-scanner"
+version = "0.1.0"
+description = "Crawl a website and log SEO, link, content, spelling and accessibility issues to CSV."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "pyspellchecker>=0.8",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.45", "axe-playwright-python>=0.1.4"]
+render = ["playwright>=1.45", "axe-playwright-python>=0.1.4"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+site-scanner = "site_scanner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["site_scanner*"]
