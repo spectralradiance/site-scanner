@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import __version__
 from .crawler import Scanner
 from .models import Config
+from .progress import Progress
 from .report import summary, write_issues_csv, write_pages_csv
+from .state import StateStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,11 +26,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("url", help="Start URL, e.g. https://example.com")
     p.add_argument("-o", "--output", help="Issues CSV path (default: <domain>-issues-<timestamp>.csv). "
                                           "A page summary is written alongside as *-pages.csv.")
+    r = p.add_argument_group("progress and resuming")
+    r.add_argument("--resume", action="store_true",
+                   help="Continue the last unfinished scan of this site, skipping work already done")
+    r.add_argument("--state-dir", metavar="DIR",
+                   help="Where scan progress is saved for --resume (default .site-scanner/<host>)")
+    r.add_argument("--report-every", type=float, default=15.0, metavar="SECONDS",
+                   help="Rewrite the CSVs with results so far this often (default 15)")
     g = p.add_argument_group("crawl")
     g.add_argument("--max-pages", type=int, default=500, help="Maximum pages to fetch (default 500)")
     g.add_argument("--max-depth", type=int, default=None, help="Maximum link depth to follow from the start page")
     g.add_argument("--workers", type=int, default=8, help="Concurrent requests (default 8)")
     g.add_argument("--delay", type=float, default=0.0, help="Seconds between requests to the site (default 0)")
+    g.add_argument("--max-crawl-delay", type=float, default=1.0,
+                   help="Cap on the robots.txt Crawl-delay, in seconds (default 1). Some sites ask for 60 s, "
+                        "which would make a scan take hours")
     g.add_argument("--timeout", type=float, default=15.0, help="Request timeout in seconds (default 15)")
     g.add_argument("--user-agent", default=Config.user_agent, help="User-Agent header to send")
     g.add_argument("--sitemap", action="append", default=[], metavar="URL",
@@ -46,8 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--browser", "--render", dest="browser", action="store_true",
                    help="Load pages in headless Chromium: checks after JavaScript runs, JS errors, failed requests, "
                         "axe accessibility audit, colour contrast, mobile layout, image sizing, server response time")
-    c.add_argument("--browser-limit", "--render-limit", dest="browser_limit", type=int, default=None,
-                   help="Browser-check at most this many pages")
+    c.add_argument("--browser-limit", "--render-limit", dest="browser_limit", type=int, default=100,
+                   help="Browser-check this many pages, spread across the site's sections "
+                        "(default 100; 0 = every page)")
     c.add_argument("--browser-workers", type=int, default=3, help="Pages loaded in parallel (default 3)")
     c.add_argument("--screenshots", metavar="DIR", help="Save desktop and mobile screenshots of each page here")
     sp = p.add_argument_group("page speed")
@@ -56,8 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--speed-profile", choices=("mobile", "desktop"), default="mobile",
                     help="mobile = slow 4G + 4x CPU slowdown like Lighthouse (default); desktop = fast connection")
     sp.add_argument("--speed-runs", type=int, default=1,
-                    help="Runs per page (default 1; pages that look slow are automatically re-run, median of 3)")
-    sp.add_argument("--speed-limit", type=int, default=None, help="Speed-test at most this many pages")
+                    help="Runs per page; the median is reported (default 1; use 3 for steadier numbers)")
+    sp.add_argument("--speed-limit", type=int, default=25,
+                    help="Speed-test this many pages: the home page and one per section first, then the shallowest "
+                         "others (default 25; 0 = every page)")
     sp.add_argument("--psi", type=int, default=0, metavar="N",
                     help="Also run Google PageSpeed Insights on N key pages (home + one per section); "
                          "gives real-user Core Web Vitals. Public sites only")
@@ -78,14 +95,19 @@ def load_words(path: str | None) -> set[str]:
         return set()
     words = set()
     for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
+        line = line.split("#", 1)[0].strip()   # allow "# comments", including after a word
+        if line:
             words.update(line.split())
     return words
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:  # show progress immediately even when output is piped (IDEs, CI, Copilot)
+            stream.reconfigure(line_buffering=True, errors="replace")
+        except (AttributeError, ValueError):
+            pass
     url = args.url if "://" in args.url else "https://" + args.url
 
     config = Config(
@@ -113,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         speed_profile=args.speed_profile,
         speed_runs=max(1, args.speed_runs),
         speed_limit=args.speed_limit,
+        max_crawl_delay=max(0.0, args.max_crawl_delay),
         psi_pages=max(0, args.psi),
         psi_key=args.psi_key,
         title_max=args.title_max,
@@ -123,28 +146,88 @@ def main(argv: list[str] | None = None) -> int:
         large_image_kb=args.large_image_kb,
     )
 
+    host = (urlsplit(url).hostname or "site").replace(":", "_")
+    state_root = Path(args.state_dir) if args.state_dir else Path(".site-scanner")
+    state_dir = state_root / host
     if args.output:
         issues_path = Path(args.output)
+    elif args.resume and StateStore.saved_output(state_dir):
+        issues_path = Path(StateStore.saved_output(state_dir))
     else:
-        host = (urlsplit(url).hostname or "site").replace(":", "_")
         issues_path = Path(f"{host}-issues-{datetime.now():%Y%m%d-%H%M%S}.csv")
     stem = issues_path.stem
     pages_stem = stem.replace("-issues", "-pages") if "-issues" in stem else stem + "-pages"
     pages_path = issues_path.with_name(pages_stem + ".csv")
+    log_path = issues_path.with_suffix(".log")
     issues_path.parent.mkdir(parents=True, exist_ok=True)
 
+    log = Progress(log_path)
+    log(f"site-scanner {__version__}  |  results: {issues_path.resolve()}")
+    log(f"Live log: {log_path.resolve()}  (follow it with: tail -f / Get-Content -Wait)")
+    store = StateStore(state_dir, fingerprint(config), args.resume, log, output=str(issues_path))
+    warned = {"locked": False}
+
+    def write_reports(result, final: bool = False) -> None:
+        for writer, path in ((write_issues_csv, issues_path), (write_pages_csv, pages_path)):
+            tmp = path.with_name(path.name + ".tmp")
+            writer(result, tmp)
+            try:
+                os.replace(tmp, path)
+            except PermissionError:
+                # Excel locks open files on Windows; keep scanning and try again next time.
+                tmp.unlink(missing_ok=True)
+                if final or not warned["locked"]:
+                    log(f"Could not update {path.name} - is it open in Excel? Close it to see updates.")
+                    warned["locked"] = True
+        if not final:
+            log(f"(report updated: {len(result.issues)} issues so far - {issues_path.name})")
+
+    scanner = None
     try:
-        result = Scanner(config).run()
+        scanner = Scanner(config, log=log, state=store, on_checkpoint=write_reports,
+                          checkpoint_every=args.report_every)
+        result = scanner.run()
     except (ValueError, RuntimeError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        log(f"Error: {exc}")
+        store.finish(complete=False)
         return 2
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
-        return 130
+        log(f"Interrupted during {scanner.phase if scanner else 'start-up'}. Progress is saved.")
+        if scanner is not None:
+            write_reports(scanner.result(), final=True)
+            log(f"Partial results written to {issues_path.resolve()}")
+        store.finish(complete=False)
+        log(f"Continue with:  site-scanner {args.url} --resume  (plus the same options)")
+        log.close()
+        sys.stdout.flush()
+        # Everything is saved; exit now instead of waiting for in-flight requests to time out.
+        os._exit(130)
 
-    write_issues_csv(result, issues_path)
-    write_pages_csv(result, pages_path)
-    print(summary(result))
-    print(f"\nIssues CSV: {issues_path.resolve()}")
-    print(f"Pages CSV:  {pages_path.resolve()}")
+    store.finish(complete=True)
+    write_reports(result, final=True)
+    words_path = issues_path.with_name(issues_path.stem.replace("-issues", "") + "-words.txt")
+    if scanner.frequent_words:
+        lines = ["# Words not in the spell-check dictionary that appear on several pages of the site.",
+                 "# Delete any that really are misspelled, then pass this file back with:",
+                 f"#   site-scanner {args.url} --dictionary {words_path.name}",
+                 "# (count = number of pages using the word)", ""]
+        lines += [f"{w}  # {n}" for w, n in sorted(scanner.frequent_words.items(), key=lambda kv: (-kv[1], kv[0]))]
+        words_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        log(f"{len(scanner.frequent_words)} frequently used unrecognised words listed in {words_path.resolve()}")
+    for line in summary(result).splitlines():
+        log(line)
+    log(f"Issues CSV: {issues_path.resolve()}")
+    log(f"Pages CSV:  {pages_path.resolve()}")
+    log.close()
     return 0
+
+
+def fingerprint(config: Config) -> dict:
+    """Settings that change results, saved with the state so a resume can warn if they differ."""
+    skip = {"workers", "browser_workers", "timeout", "delay", "max_crawl_delay", "psi_key", "screenshots_dir"}
+    out = {}
+    for k, v in asdict(config).items():
+        if k in skip:
+            continue
+        out[k] = sorted(v) if isinstance(v, set) else v
+    return out

@@ -23,3 +23,7 @@ site-scanner = "site_scanner.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["site_scanner*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["tests"]
+testpaths = ["tests"]

@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from collections import defaultdict, deque
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 
 from .checks import analyze_page
 from .fetcher import Fetcher
-from .models import ERROR, NOTICE, SEVERITY_ORDER, WARNING, Config, Issue, LinkStatus, Page, SiteWideIssues
+from .models import (ERROR, NOTICE, SEVERITY_ORDER, WARNING, Config, Issue, LinkStatus, Page, SiteWideIssues,
+                     page_from_dict)
+from .progress import Counter
 from .sitemap import RobotsInfo, SitemapResult, load_robots, load_sitemaps
 from .spelling import SpellCheck
 from .urls import is_internal, looks_like_page, normalize_url
 
 UNVERIFIABLE_STATUSES = {401, 403, 405, 406, 429, 999}
+FREQUENT_WORD_PAGES = 3   # an unknown word on this many pages is treated as vocabulary
 
 
 def _log(msg: str) -> None:
@@ -34,9 +38,21 @@ class ScanResult:
 
 
 class Scanner:
-    def __init__(self, config: Config, log=_log):
+    def __init__(self, config: Config, log=_log, state=None, on_checkpoint=None, checkpoint_every: float = 15.0):
+        """``state``: optional StateStore for saving/resuming progress.
+        ``on_checkpoint(result)``: called with a partial ScanResult every ``checkpoint_every`` seconds
+        and after each phase, so reports can be written while the scan is still running."""
         self.config = config
         self.log = log
+        self.state = state
+        self.on_checkpoint = on_checkpoint
+        self.checkpoint_every = checkpoint_every
+        self._last_checkpoint = time.monotonic()
+        self.inlinks: dict[str, set[str]] = {}
+        self.depths: dict[str, int] = {}
+        self.phase = "starting"
+        self.frequent_words: dict[str, int] = {}
+        self.aggs: list[SiteWideIssues] = []   # site-wide issues collected by browser/speed passes
         start = normalize_url(config.start_url)
         if not start:
             raise ValueError(f"Not a valid http(s) URL: {config.start_url}")
@@ -87,9 +103,11 @@ class Scanner:
         cfg = self.config
         self.log(f"Scanning {self.start}")
         self.robots = load_robots(self.fetcher, self.start, cfg.user_agent)
-        if cfg.respect_robots and self.robots.crawl_delay and self.robots.crawl_delay > self.fetcher.delay:
-            self.fetcher.delay = min(self.robots.crawl_delay, 10.0)
-            self.log(f"robots.txt requests a crawl delay of {self.robots.crawl_delay}s; using {self.fetcher.delay}s")
+        wanted = self.robots.crawl_delay if cfg.respect_robots else None
+        if wanted and wanted > self.fetcher.delay:
+            self.fetcher.delay = max(self.fetcher.delay, min(wanted, cfg.max_crawl_delay))
+            capped = " (capped; use --max-crawl-delay to change)" if wanted > cfg.max_crawl_delay else ""
+            self.log(f"robots.txt asks for {wanted:g} s between requests; waiting {self.fetcher.delay:g} s{capped}")
         self.sitemap = load_sitemaps(self.fetcher, self.start, self.robots, cfg.extra_sitemaps)
         if self.sitemap.urls:
             self.log(f"Sitemap: {len(self.sitemap.urls)} URLs from {len(self.sitemap.files)} file(s) "
@@ -97,27 +115,68 @@ class Scanner:
         else:
             self.log("No sitemap URLs found")
 
-        self._crawl()
+        self._phase("crawl", self._crawl)
         if cfg.render:
-            self._browser_checks()   # before link checking, so JS-added links are checked too
-        self._check_links()
-        inlinks, depths = self._site_checks()
+            # before link checking, so links added by JavaScript are checked too
+            self._phase("browser checks", self._browser_checks, optional=True)
+        self._phase("link checks", self._check_links)
+        self._phase("site-wide checks", self._site_checks)
         if cfg.speed:
-            self._speed_checks()
+            self._phase("speed tests", self._speed_checks, optional=True)
         if cfg.psi_pages:
-            self._psi_checks(depths)
+            self._phase("PageSpeed Insights", self._psi_checks)
+        self.phase = "complete"
+        return self.result()
 
-        issues = [i for p in self.pages.values() for i in p.issues] + self.site_issues
+    def _phase(self, name: str, fn, optional: bool = False) -> None:
+        self.phase = name
+        started = time.monotonic()
+        self.log(f"--- {name} ---")
+        try:
+            fn()
+        except RuntimeError as exc:
+            if not optional:
+                raise
+            # e.g. Chromium not installed: report it and carry on with the rest of the scan
+            self.log(f"WARNING: {name} skipped: {exc}")
+            self._site_issue(self.start, "Technical", f"{name.capitalize()} skipped", WARNING, str(exc).splitlines()[0])
+            return
+        self.log(f"--- {name} done in {time.monotonic() - started:.0f} s ---")
+        self.checkpoint(force=True)
+
+    def result(self) -> ScanResult:
+        """The scan's results so far (complete once run() has returned)."""
+        issues = [i for p in list(self.pages.values()) for i in p.issues] + list(self.site_issues)
+        for agg in self.aggs:
+            issues.extend(agg.issues())
         issues.sort(key=lambda i: (SEVERITY_ORDER.get(i.severity, 9), i.page_url, i.category, i.issue, i.target))
         return ScanResult(
             start_url=self.start,
             pages=list(self.pages.values()),
             issues=issues,
-            inlinks={k: len(v) for k, v in inlinks.items()},
-            depths=depths,
+            inlinks={k: len(v) for k, v in self.inlinks.items()},
+            depths=dict(self.depths),
             sitemap_urls={self._resolve(u) for u in self.sitemap.urls},
             truncated=self.truncated,
         )
+
+    def checkpoint(self, force: bool = False) -> None:
+        if self.on_checkpoint is None:
+            return
+        if not force and time.monotonic() - self._last_checkpoint < self.checkpoint_every:
+            return
+        self._last_checkpoint = time.monotonic()
+        try:
+            self.on_checkpoint(self.result())
+        except Exception as exc:  # never let report writing stop the scan
+            self.log(f"Could not write the in-progress report: {exc}")
+
+    def _save(self, kind: str, key: str, value) -> None:
+        if self.state is not None:
+            self.state.put(kind, key, value)
+
+    def _saved(self, kind: str, key: str):
+        return self.state.get(kind, key) if self.state is not None else None
 
     # ------------------------------------------------------------------
     def _process(self, url: str) -> Page:
@@ -162,35 +221,60 @@ class Scanner:
             enqueue(u, 0, "sitemap")
 
         fetched = 0
-        with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-            futures = {}
+
+        def handle(url: str, depth: int, via: str, page: Page, saved: bool) -> None:
+            page.found_via = via
+            self.requested[url] = page
+            if not saved:
+                self._save("pages", url, page)
+            self.fetcher.seed_cache(LinkStatus(url=url, status=page.status, final_url=page.final_url,
+                                               error=page.error, content_type=page.content_type))
+            if page.final_url != url:
+                self.redirects[url] = page.final_url
+                seen.add(page.final_url)
+            status = page.status if page.status is not None else "ERR"
+            note = " (saved)" if saved else f" {page.elapsed_ms / 1000:.1f}s"
+            if page.final_url in self.pages:
+                self.log(f"[crawl {len(self.pages)} done, {len(queue) + len(futures)} to go] {status}{note} duplicate of "
+                         f"{page.final_url} <- {url}")
+                return
+            self.pages[page.final_url] = page
+            if page.error:
+                what = page.error
+            elif page.is_html:
+                what = f"{len(page.issues)} issue(s)"
+            else:
+                what = page.content_type or "not HTML"
+            moved = f" -> {page.final_url}" if page.final_url != url else ""
+            self.log(f"[crawl {len(self.pages)} done, {len(queue) + len(futures)} to go] {status}{note} {what}  {url}{moved}")
+            if cfg.max_depth is None or depth < cfg.max_depth:
+                for link in page.links:
+                    if link.kind == "a":
+                        enqueue(link.url, depth + 1, "link")
+            self.checkpoint()
+
+        pool = ThreadPoolExecutor(max_workers=cfg.workers)
+        futures = {}
+        try:
             while queue or futures:
                 while queue and len(futures) < cfg.workers * 2 and fetched < cfg.max_pages:
                     url, depth, via = queue.popleft()
-                    futures[pool.submit(self._process, url)] = (url, depth, via)
                     fetched += 1
+                    saved = self._saved("pages", url)
+                    if saved is not None:
+                        handle(url, depth, via, page_from_dict(saved), saved=True)
+                        continue
+                    futures[pool.submit(self._process, url)] = (url, depth, via)
                 if not futures:
+                    if queue and fetched < cfg.max_pages:
+                        continue
                     break
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for fut in done:
                     url, depth, via = futures.pop(fut)
-                    page = fut.result()
-                    page.found_via = via
-                    self.requested[url] = page
-                    self.fetcher.seed_cache(LinkStatus(url=url, status=page.status, final_url=page.final_url,
-                                                       error=page.error, content_type=page.content_type))
-                    if page.final_url != url:
-                        self.redirects[url] = page.final_url
-                        seen.add(page.final_url)
-                    if page.final_url in self.pages:
-                        continue
-                    self.pages[page.final_url] = page
-                    if len(self.pages) % 25 == 0:
-                        self.log(f"  crawled {len(self.pages)} pages ({len(queue)} queued)")
-                    if cfg.max_depth is None or depth < cfg.max_depth:
-                        for link in page.links:
-                            if link.kind == "a":
-                                enqueue(link.url, depth + 1, "link")
+                    handle(url, depth, via, fut.result(), saved=False)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         self.truncated = bool(queue)
         self.log(f"Crawled {len(self.pages)} pages" + (" (page limit reached)" if self.truncated else ""))
 
@@ -209,13 +293,52 @@ class Scanner:
             if not internal and not cfg.check_external:
                 continue
             to_check.append(url)
-        self.log(f"Checking {len(to_check)} unique link/resource URLs")
-        with ThreadPoolExecutor(max_workers=max(cfg.workers, 8)) as pool:
-            results = pool.map(lambda u: self.fetcher.check(u, polite=self._internal(u)), to_check)
-            for i, st in enumerate(results, 1):
+        # Statuses already known: pages fetched by the crawl, and links saved by an earlier run.
+        known = 0
+        for url in to_check:
+            saved = self._saved("links", url)
+            if saved is not None:
+                self.fetcher.seed_cache(LinkStatus(**saved))
+                known += 1
+            elif url in self.requested:
+                known += 1
+        pending = [u for u in to_check if u not in self.requested and self._saved("links", u) is None]
+        for url in to_check:
+            if url not in pending:
+                self.link_status[url] = self.fetcher.check(url)
+        referrers: dict[str, int] = defaultdict(int)
+        for page in self.pages.values():
+            for u in {l.url for l in page.links}:
+                referrers[u] += 1
+        ext = sum(1 for u in pending if not self._internal(u))
+        self.log(f"{len(to_check)} unique link/resource URLs: {known} already known, checking {len(pending)} "
+                 f"({len(pending) - ext} on this site, {ext} external)")
+        counter = Counter(self.log, "links", len(pending))
+        last_line = time.monotonic()
+        bad = 0
+        pool = ThreadPoolExecutor(max_workers=max(cfg.workers, 8))
+        try:
+            futs = {pool.submit(self.fetcher.check, u, self._internal(u)): u for u in pending}
+            for fut in as_completed(futs):
+                st = fut.result()
                 self.link_status[st.url] = st
-                if i % 200 == 0:
-                    self.log(f"  checked {i}/{len(to_check)}")
+                self._save("links", st.url, st)
+                counter.done += 1
+                problem = st.status is None or st.status >= 400
+                if problem and st.status in UNVERIFIABLE_STATUSES and not self._internal(st.url):
+                    counter.tick(f"unverified HTTP {st.status} (site may block bots)  {st.url}", count=False)
+                elif problem:
+                    bad += 1
+                    why = st.error or f"HTTP {st.status}"
+                    counter.tick(f"PROBLEM {why}  {st.url}  (linked from {referrers[st.url]} page(s))", count=False)
+                elif time.monotonic() - last_line > 5 or counter.done == len(pending):
+                    counter.tick(f"{bad} problem(s) so far", count=False)
+                else:
+                    continue
+                last_line = time.monotonic()
+                self.checkpoint()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         kind_names = {"a": "link", "img": "image", "resource": "resource", "og:image": "featured image"}
         for page in self.pages.values():
@@ -262,7 +385,7 @@ class Scanner:
                                                  f"og:image returns Content-Type {st.content_type}.", link.url))
 
     # ------------------------------------------------------------------
-    def _site_checks(self) -> tuple[dict[str, set[str]], dict[str, int]]:
+    def _site_checks(self) -> None:
         cfg = self.config
         html_pages = [p for p in self.pages.values() if p.is_html]
 
@@ -363,9 +486,26 @@ class Scanner:
                                      f"Shared with {len(others)} other page(s).",
                                      " | ".join(others[:5]) + (" ..." if len(others) > 5 else ""))
 
+        # Unrecognised words used on many pages are almost always real terms (jargon, names), not typos:
+        # report each once, and list them so they can be added to a --dictionary file.
+        typo_pages: dict[str, list[Page]] = defaultdict(list)
+        for page in html_pages:
+            for i in page.issues:
+                if i.issue == "Possible typo":
+                    typo_pages[i.target].append(page)
+        self.frequent_words = {w: len(ps) for w, ps in typo_pages.items() if len(ps) >= FREQUENT_WORD_PAGES}
+        for word, count in sorted(self.frequent_words.items(), key=lambda kv: -kv[1]):
+            for page in typo_pages[word]:
+                page.issues = [i for i in page.issues if not (i.issue == "Possible typo" and i.target == word)]
+            first = min(typo_pages[word], key=lambda p: (len(p.final_url), p.final_url))
+            self._site_issue(first.final_url, "Spelling", "Unrecognised word used on many pages", NOTICE,
+                             f"Not in the dictionary but used on {count} pages, so probably a correct term or name. "
+                             "If so, add it to a --dictionary file (see the -words.txt file next to this report).",
+                             word)
+
         # Typos in shared template areas (header/nav/footer) are reported once, not per page
         template: dict[str, list] = {}
-        for page in html_pages:
+        for page in sorted(html_pages, key=lambda p: (len(p.final_url), p.final_url)):
             for word, (suggestion, ctx) in page.template_typos.items():
                 entry = template.setdefault(word, [page.final_url, suggestion, ctx, 0])
                 entry[3] += 1
@@ -377,7 +517,7 @@ class Scanner:
         if self.truncated:
             self._site_issue(self.start, "Technical", "Crawl limit reached", NOTICE,
                              f"Stopped after {cfg.max_pages} pages; raise --max-pages for a complete scan.")
-        return inlinks, depths
+        self.inlinks, self.depths = inlinks, depths
 
     # ------------------------------------------------------------------
     def _html_urls(self, limit: int | None) -> list[str]:
@@ -385,31 +525,83 @@ class Scanner:
         return urls[:limit] if limit else urls
 
     def _browser_checks(self) -> None:
-        from .browser import apply_browser_result, run_browser_audit
+        from .browser import apply_browser_result, browser_result_from_dict, run_browser_audit, summarize
 
-        urls = self._html_urls(self.config.render_limit)
-        self.log(f"Browser checks: loading {len(urls)} pages in headless Chromium")
-        results = run_browser_audit(urls, self.config, self.log)
+        from .psi import sample_pages
+
+        html = [p for p in self.pages.values() if p.is_html]
+        urls = [p.final_url for p in sample_pages(html, self.depths, self.config.render_limit)]
+        if len(urls) < len(html):
+            self.log(f"Browser-checking a sample of {len(urls)} of {len(html)} pages, spread across the site's "
+                     f"sections. Use --browser-limit 0 to check every page.")
         agg = SiteWideIssues()
-        for url, br in results.items():
+        self.aggs.append(agg)
+        counter = Counter(self.log, "browser", len(urls))
+
+        def apply(url, br, seconds, saved=False):
             page = self.pages[url]
             apply_browser_result(page, br, self.config, self.spell, page.headers, agg)
-        self.site_issues.extend(agg.issues())
+            if not saved:
+                self._save("browser", url, br)
+            counter.tick(f"{'(saved)' if saved else f'{seconds:.1f}s'} {summarize(br)}  {url}")
+            self.checkpoint()
+
+        todo = []
+        for url in urls:
+            saved = self._saved("browser", url)
+            if saved is not None:
+                apply(url, browser_result_from_dict(saved), 0, saved=True)
+            else:
+                todo.append(url)
+        if todo:
+            self.log(f"Loading {len(todo)} page(s) in headless Chromium, {self.config.browser_workers} at a time")
+            run_browser_audit(todo, self.config, self.log, on_result=apply)
 
     def _speed_checks(self) -> None:
-        from .speed import apply_speed_result, run_speed_tests
+        from .psi import sample_pages
+        from .speed import PROFILES, apply_speed_result, run_speed_tests, speed_result_from_dict, summarize
 
-        urls = self._html_urls(self.config.speed_limit)
-        self.log(f"Speed tests: measuring {len(urls)} pages one at a time ({self.config.speed_profile} profile)")
-        results = run_speed_tests(urls, self.config, self.log)
+        html = [p for p in self.pages.values() if p.is_html]
+        chosen = [p.final_url for p in sample_pages(html, self.depths, self.config.speed_limit)]
         agg = SiteWideIssues()
-        for url, res in results.items():
+        self.aggs.append(agg)
+        counter = Counter(self.log, "speed", len(chosen))
+        if len(chosen) < len(html):
+            self.log(f"Speed-testing a sample of {len(chosen)} of {len(html)} pages (the home page and one per "
+                     f"section first). Use --speed-limit 0 to test every page.")
+        self.log(f"Profile: {PROFILES[self.config.speed_profile]['label']}, {self.config.speed_runs} run(s) per page")
+
+        def apply(url, res, seconds, saved=False):
             apply_speed_result(self.pages[url], res, self.start, self.config, agg)
-        self.site_issues.extend(agg.issues())
+            if not saved:
+                self._save("speed", url, res)
+            counter.tick(f"{'(saved)' if saved else f'{seconds:.1f}s'} {summarize(res)}  {url}")
+            self.checkpoint()
 
-    def _psi_checks(self, depths: dict[str, int]) -> None:
-        from .psi import pick_pages, run_psi
+        todo = []
+        for url in chosen:
+            saved = self._saved("speed", url)
+            if saved is not None:
+                apply(url, speed_result_from_dict(saved), 0, saved=True)
+            else:
+                todo.append(url)
+        if todo:
+            run_speed_tests(todo, self.config, self.log, on_result=apply)
 
-        pages = pick_pages([p for p in self.pages.values() if p.is_html], depths, self.config.psi_pages)
-        self.log(f"PageSpeed Insights: testing {len(pages)} page(s) (about 20-30 s each)")
-        run_psi(pages, self.config.speed_profile, self.config.psi_key, self.config.timeout, self.log)
+    def _psi_checks(self) -> None:
+        from .psi import apply_psi, fetch_psi, pick_pages, summarize
+
+        pages = pick_pages([p for p in self.pages.values() if p.is_html], self.depths, self.config.psi_pages)
+        counter = Counter(self.log, "psi", len(pages))
+        self.log(f"Testing {len(pages)} page(s) with Google PageSpeed Insights (about 20-30 s each)")
+        for page in pages:
+            saved = self._saved("psi", page.final_url)
+            started = time.monotonic()
+            result = saved if saved is not None else fetch_psi(
+                page.final_url, self.config.speed_profile, self.config.psi_key, self.config.timeout)
+            if saved is None and "data" in result:
+                self._save("psi", page.final_url, result)
+            apply_psi(page, result, self.config.speed_profile)
+            took = "(saved)" if saved is not None else f"{time.monotonic() - started:.0f}s"
+            counter.tick(f"{took} {summarize(result)}  {page.final_url}")
+            self.checkpoint()

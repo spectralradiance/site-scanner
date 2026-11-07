@@ -17,6 +17,7 @@ class Config:
     max_depth: int | None = None
     workers: int = 8
     delay: float = 0.0
+    max_crawl_delay: float = 1.0       # cap on robots.txt Crawl-delay
     timeout: float = 15.0
     user_agent: str = "SiteScanner/0.1 (website audit crawler)"
     check_external: bool = True
@@ -31,14 +32,14 @@ class Config:
     spell_check_capitalized: bool = False
     # Browser checks (Playwright): rendered DOM, JS errors, axe, contrast, mobile layout
     render: bool = False
-    render_limit: int | None = None
+    render_limit: int | None = 100         # pages to browser-check (sampled); 0/None = all
     browser_workers: int = 3
     screenshots_dir: str | None = None
     # Speed (Playwright, throttled)
     speed: bool = False
     speed_profile: str = "mobile"        # "mobile" or "desktop"
     speed_runs: int = 1
-    speed_limit: int | None = None
+    speed_limit: int | None = 25          # pages to speed-test (a sample across sections); 0 = all
     # Google PageSpeed Insights
     psi_pages: int = 0
     psi_key: str | None = None
@@ -98,6 +99,16 @@ class Page:
     screenshots: list[str] = field(default_factory=list)
 
 
+def page_from_dict(d: dict) -> Page:
+    """Rebuild a Page saved by the state store."""
+    d = dict(d)
+    d["links"] = [Link(**x) for x in d.get("links", [])]
+    d["issues"] = [Issue(**x) for x in d.get("issues", [])]
+    d["template_typos"] = {k: tuple(v) for k, v in (d.get("template_typos") or {}).items()}
+    known = Page.__dataclass_fields__
+    return Page(**{k: v for k, v in d.items() if k in known})
+
+
 class SiteWideIssues:
     """Collects issues about shared resources (a CSS file, an image...) so each is reported once
     for the whole site, with a count of affected pages, instead of once per page."""
@@ -111,11 +122,9 @@ class SiteWideIssues:
         key = (issue, target)
         item = self._items.get(key)
         if item is None:
-            item = self._items[key] = {"page_url": page_url, "page_title": page_title, "category": category,
-                                       "issue": issue, "severity": severity, "details": details,
-                                       "pages": {page_url}, "files": {}}
-        else:
-            item["pages"].add(page_url)
+            item = self._items[key] = {"category": category, "issue": issue, "severity": severity,
+                                       "details": details, "pages": {}, "files": {}}
+        item["pages"].setdefault(page_url, page_title)
         if file:
             item["files"].setdefault(file, None)
 
@@ -129,7 +138,9 @@ class SiteWideIssues:
             n = len(it["pages"])
             if n > 1:
                 details += f" Affects {n} page(s)."
-            out.append(Issue(it["page_url"], it["page_title"], it["category"], issue, it["severity"], details, target))
+            # Report under the shortest URL (usually the home page) so results don't depend on crawl order.
+            page_url = min(it["pages"], key=lambda u: (len(u), u))
+            out.append(Issue(page_url, it["pages"][page_url], it["category"], issue, it["severity"], details, target))
         return out
 
 

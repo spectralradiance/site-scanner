@@ -57,3 +57,25 @@ def test_pick_pages_one_per_section():
     chosen = [p.final_url for p in pick_pages(pages, depths, 10)]
     assert chosen == ["https://ex.com/", "https://ex.com/blog/a", "https://ex.com/shop/x", "https://ex.com/about"]
     assert not is_public("http://localhost:8000/") and is_public("https://ex.com/")
+
+
+def test_dictionary_file_comments(tmp_path):
+    from site_scanner.cli import load_words
+    f = tmp_path / "words.txt"
+    f.write_text("# header\nwastewater  # 29\nzoonotic\n\ncoli spp  # two words\n", encoding="utf-8")
+    assert load_words(str(f)) == {"wastewater", "zoonotic", "coli", "spp"}
+
+
+def test_sample_pages_round_robin():
+    from site_scanner.psi import sample_pages
+    urls = (["https://ex.com/"] + [f"https://ex.com/details/{i}/" for i in range(50)]
+            + [f"https://ex.com/map/s{i}/" for i in range(5)] + ["https://ex.com/about/"])
+    pages = [Page(url=u, final_url=u, is_html=True) for u in urls]
+    chosen = [p.final_url for p in sample_pages(pages, {}, 10)]
+    assert chosen[0] == "https://ex.com/"
+    assert len(chosen) == 10
+    # sections take turns: home, about, then map and details alternate (4 each)
+    assert sum("/map/" in u for u in chosen) == 4
+    assert sum("/details/" in u for u in chosen) == 4
+    assert "https://ex.com/about/" in chosen
+    assert len(sample_pages(pages, {}, 0)) == len(pages)

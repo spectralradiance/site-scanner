@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Callable
 from urllib.parse import urlsplit
 
 import requests
@@ -20,19 +19,52 @@ FIELD_METRICS = {
 }
 
 
-def pick_pages(pages: list[Page], depths: dict[str, int], limit: int) -> list[Page]:
-    """The start page plus one page per top-level section (/blog/, /products/...), shallowest first."""
+def order_pages(pages: list[Page], depths: dict[str, int]) -> tuple[list[Page], list[Page]]:
+    """Split pages into (one representative per top-level section, everything else), shallowest first.
+    The start page always comes first."""
     ordered = sorted(pages, key=lambda p: (depths.get(p.final_url, 10**6), len(p.final_url)))
-    chosen, sections = [], set()
+    reps, rest, sections = [], [], set()
     for p in ordered:
         parts = [s for s in urlsplit(p.final_url).path.split("/") if s]
         section = parts[0] if len(parts) > 1 else ("" if not parts else "(top-level page)")
-        if section in sections and len(chosen) > 0:
-            continue
-        sections.add(section)
-        chosen.append(p)
-        if len(chosen) >= limit:
+        if section in sections:
+            rest.append(p)
+        else:
+            sections.add(section)
+            reps.append(p)
+    return reps, rest
+
+
+def pick_pages(pages: list[Page], depths: dict[str, int], limit: int) -> list[Page]:
+    """The start page plus one page per top-level section (/blog/, /products/...), shallowest first."""
+    return order_pages(pages, depths)[0][:limit]
+
+
+def sample_pages(pages: list[Page], depths: dict[str, int], limit: int | None) -> list[Page]:
+    """Pick up to ``limit`` pages (0/None = all) spread across the site: the start page, then one page
+    from each top-level section in turn (/details/, /map/, /blog/...), shallowest first within each."""
+    if not limit or limit >= len(pages):
+        reps, rest = order_pages(pages, depths)
+        return reps + rest
+    ordered = sorted(pages, key=lambda p: (depths.get(p.final_url, 10**6), len(p.final_url)))
+    groups: dict[str, list[Page]] = {}
+    for p in ordered:
+        parts = [s for s in urlsplit(p.final_url).path.split("/") if s]
+        section = parts[0] if len(parts) > 1 else ("" if not parts else "(top-level page)")
+        groups.setdefault(section, []).append(p)
+    chosen: list[Page] = []
+    i = 0
+    while len(chosen) < limit:
+        added = False
+        for members in groups.values():
+            if i < len(members):
+                chosen.append(members[i])
+                added = True
+                if len(chosen) >= limit:
+                    break
+        if not added:
             break
+        i += 1
     return chosen
 
 
@@ -42,43 +74,57 @@ def is_public(url: str) -> bool:
                 or host.startswith(("10.", "192.168.")))
 
 
-def run_psi(pages: list[Page], strategy: str, api_key: str | None, timeout: float,
-            log: Callable[[str], None]) -> None:
-    session = requests.Session()
-    for i, page in enumerate(pages, 1):
-        url, title = page.final_url, page.title
-        if not is_public(url):
-            page.issues.append(Issue(url, title, "Performance", "PageSpeed Insights skipped", NOTICE,
-                                     "PageSpeed Insights can only test publicly reachable URLs."))
+def fetch_psi(url: str, strategy: str, api_key: str | None, timeout: float) -> dict:
+    """Call the PageSpeed Insights API. Returns {"data": trimmed response} or {"error": message}."""
+    if not is_public(url):
+        return {"error": "PageSpeed Insights can only test publicly reachable URLs.", "skipped": True}
+    params = {"url": url, "strategy": strategy, "category": "performance"}
+    if api_key:
+        params["key"] = api_key
+    err = "no response"
+    for attempt in range(2):
+        try:
+            resp = requests.get(API, params=params, timeout=max(timeout, 90))
+        except requests.RequestException as exc:
+            err = type(exc).__name__
             continue
-        params = {"url": url, "strategy": strategy, "category": "performance"}
-        if api_key:
-            params["key"] = api_key
-        data = None
-        for attempt in range(2):
+        if resp.status_code == 429 and attempt == 0 and api_key:
+            time.sleep(10)
+            continue
+        if resp.status_code != 200:
             try:
-                resp = session.get(API, params=params, timeout=max(timeout, 90))
-            except requests.RequestException as exc:
-                err = f"{type(exc).__name__}"
-                continue
-            if resp.status_code == 429 and attempt == 0:
-                time.sleep(10)
-                continue
-            if resp.status_code != 200:
-                try:
-                    err = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
-                except ValueError:
-                    err = f"HTTP {resp.status_code}"
-                if resp.status_code == 429 and not api_key:
-                    err += " (rate limited: add a free API key with --psi-key)"
-                break
-            data = resp.json()
-            break
-        if data is None:
-            page.issues.append(Issue(url, title, "Performance", "PageSpeed Insights failed", NOTICE, err))
-            continue
-        _apply(page, data, strategy)
-        log(f"  PageSpeed Insights {i}/{len(pages)}: {url}")
+                err = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
+            except ValueError:
+                err = f"HTTP {resp.status_code}"
+            if resp.status_code == 429 and not api_key:
+                err += " (rate limited: add a free API key with --psi-key)"
+            return {"error": err}
+        data = resp.json()
+        lh = data.get("lighthouseResult") or {}
+        # keep only what _apply needs (full responses are several hundred KB)
+        return {"data": {
+            "loadingExperience": data.get("loadingExperience"),
+            "originLoadingExperience": data.get("originLoadingExperience"),
+            "lighthouseResult": {"categories": lh.get("categories"), "audits": lh.get("audits")},
+        }}
+    return {"error": err}
+
+
+def apply_psi(page: Page, result: dict, strategy: str) -> None:
+    if "data" in result:
+        _apply(page, result["data"], strategy)
+        return
+    issue = "PageSpeed Insights skipped" if result.get("skipped") else "PageSpeed Insights failed"
+    page.issues.append(Issue(page.final_url, page.title, "Performance", issue, NOTICE, result.get("error", "")))
+
+
+def summarize(result: dict) -> str:
+    if "data" not in result:
+        return "FAILED " + result.get("error", "")
+    lh = result["data"].get("lighthouseResult") or {}
+    score = ((lh.get("categories") or {}).get("performance") or {}).get("score")
+    field = (result["data"].get("loadingExperience") or {}).get("overall_category") or "no field data"
+    return f"Lighthouse score {round(score * 100) if score is not None else '-'}, real users: {field}"
 
 
 def _apply(page: Page, data: dict, strategy: str) -> None:

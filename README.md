@@ -39,6 +39,38 @@ Two files are written:
 | `example.com-issues-<timestamp>.csv` | One row per issue: **Page Title, URL, Severity, Category, Issue, Details, Target** |
 | `example.com-pages-<timestamp>.csv` | One row per URL: status, title/description lengths, H1 count, word count, inlinks, click depth, in sitemap?, issue counts, and with `--browser`/`--speed`: server response time, DOM size, FCP, LCP, CLS, TBT, page weight, requests, PSI score, screenshot paths |
 
+### Progress, partial results and resuming
+
+* **Live progress:** every page, link problem, browser check and speed test is printed as it finishes,
+  with the elapsed time and an ETA, e.g.
+  `[03:12] [speed 4/25 ETA 05:40] 9.8s LCP 3.1s  FCP 1.2s  CLS 0.02  TBT 140ms  1.4 MB, 52 requests  https://...`.
+  The same lines go to a log file next to the CSV (`<name>.log`), so you can follow a scan that runs
+  somewhere without a live console: `Get-Content reports\site.log -Wait` (PowerShell) or `tail -f`.
+* **Partial results:** the CSVs are rewritten with everything found so far every 15 seconds
+  (`--report-every`) and after each phase. If a CSV is open in Excel the update is skipped until you close it.
+* **Resume:** every finished page, link check, browser check and speed test is saved to
+  `.site-scanner/<host>/` as it completes. If a scan is interrupted (Ctrl+C, closed terminal, crash),
+  run the same command with `--resume` and only the missing work is done:
+
+  ```bash
+  site-scanner https://example.com --speed -o reports/example.csv
+  # ...interrupted...
+  site-scanner https://example.com --speed -o reports/example.csv --resume
+  ```
+
+### What makes a scan slow
+
+* **robots.txt `Crawl-delay`:** some sites ask for up to 60 s between requests. The scanner caps this
+  at 1 s (`--max-crawl-delay`) and says so at the start.
+* **Big sites behind a small sitemap:** search results and filter pages can lead to hundreds of pages.
+  The progress output shows this as it happens; use `--exclude` (e.g. `--exclude "/search/"`) or
+  `--max-pages` to rein it in.
+* **Browser and speed checks** cost seconds per page, so by default they run on a sample spread across the
+  site's sections: 100 pages for `--browser`, 25 for `--speed`. Use `--browser-limit 0` / `--speed-limit 0`
+  to cover every page.
+* **Slow external sites** fail after 5 s (connect) / 15 s (read), with no long retries. Use `--no-external`
+  to skip them entirely.
+
 `Target` holds the specific thing at fault: the broken link URL, the misspelled word, the image, the
 CSS selector of the element, the slow script, etc. Rows are sorted Error, then Warning, then Notice.
 
@@ -53,7 +85,11 @@ repeated on every page.
 | `--max-pages N` | 500 | Stop after fetching N pages |
 | `--max-depth N` | none | Only follow links N clicks from the start page |
 | `--workers N` | 8 | Concurrent requests |
-| `--delay S` | 0 | Seconds between requests to the site (robots.txt `Crawl-delay` is honoured) |
+| `--resume` | | Continue the last unfinished scan of this site |
+| `--state-dir DIR` | `.site-scanner/<host>` | Where progress is saved for `--resume` |
+| `--report-every S` | 15 | Rewrite the CSVs with results so far this often |
+| `--delay S` | 0 | Seconds between requests to the site |
+| `--max-crawl-delay S` | 1 | Cap on robots.txt `Crawl-delay` |
 | `--no-external` | | Don't check links to other websites (much faster) |
 | `--exclude REGEX` | | Skip matching URLs, repeatable (e.g. `--exclude "/tag/" --exclude "\?page="`) |
 | `--sitemap URL` | auto | Use a specific sitemap (repeatable) |
@@ -65,14 +101,14 @@ repeated on every page.
 | `--language` | en | Spell-check language (en, es, fr, de, it, pt, nl, ru...) |
 | **Browser** | | |
 | `--browser` | | Load every page in headless Chromium (see below) |
-| `--browser-limit N` | all | Only browser-check the first N pages |
+| `--browser-limit N` | 100 | Browser-check N pages spread across the site's sections (0 = all) |
 | `--browser-workers N` | 3 | Pages loaded in parallel |
 | `--screenshots DIR` | | Save full-page desktop and mobile screenshots |
 | **Speed** | | |
 | `--speed` | | Measure page speed and find causes (implies `--browser`) |
 | `--speed-profile` | mobile | `mobile` = slow 4G + 4x CPU slowdown (like Lighthouse); `desktop` = fast connection |
-| `--speed-runs N` | 1 | Runs per page. Pages that look slow are re-run automatically and the median of 3 is reported |
-| `--speed-limit N` | all | Only speed-test the first N pages |
+| `--speed-runs N` | 1 | Runs per page; the median is reported (3 gives steadier numbers) |
+| `--speed-limit N` | 25 | Speed-test N pages: the home page and one per section first (0 = all) |
 | `--psi N` | 0 | Run Google PageSpeed Insights on N key pages (home + one per section) |
 | `--psi-key KEY` | `$PSI_API_KEY` | PageSpeed Insights API key ([free](https://developers.google.com/speed/docs/insights/v5/get-started)); without one Google rate-limits heavily |
 | **Thresholds** | | |
@@ -100,6 +136,10 @@ images over the size threshold.
 **Spelling:** possible typos (with a suggested correction and surrounding context) and repeated words
 ("the the"). Typos in the header, nav and footer are reported once for the whole site. Capitalised
 words are skipped (except at the start of a sentence) because they are usually names.
+An unrecognised word used on 3 or more pages is almost always a real term (e.g. "wastewater",
+"zoonotic"), so it is reported once as *Unrecognised word used on many pages* instead of on every page,
+and listed in `<name>-words.txt` next to the report. Delete any real misspellings from that file and pass
+it back with `--dictionary <name>-words.txt` on the next scan.
 
 **Formatting:** skipped heading levels, empty headings, very long paragraphs, consecutive `<br>` tags,
 empty paragraphs, deprecated tags, missing viewport meta tag, lorem ipsum placeholder text, low word count.

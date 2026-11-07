@@ -61,7 +61,8 @@ def _describe_error(exc: Exception) -> str:
 
 class Fetcher:
     def __init__(self, user_agent: str, timeout: float = 15.0, delay: float = 0.0, pool_size: int = 16):
-        self.timeout = timeout
+        # (connect, read): an unreachable host fails within 5 s instead of the full read timeout
+        self.timeout = (min(5.0, timeout), timeout)
         self.delay = delay
         self.session = requests.Session()
         self.session.headers.update({
@@ -69,14 +70,17 @@ class Fetcher:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en;q=0.9,*;q=0.5",
         })
+        # One quick retry for transient gateway errors. No retries on read timeouts, and Retry-After
+        # is ignored: a server asking us to wait minutes would otherwise stall the whole scan.
         retry = Retry(
-            total=2,
-            connect=2,
-            read=1,
-            backoff_factor=0.5,
-            status_forcelist=(429, 502, 503, 504),
+            total=1,
+            connect=1,
+            read=0,
+            status=1,
+            backoff_factor=0.3,
+            status_forcelist=(502, 503, 504),
             allowed_methods=frozenset({"HEAD", "GET"}),
-            respect_retry_after_header=True,
+            respect_retry_after_header=False,
             raise_on_status=False,
         )
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=retry)
@@ -178,6 +182,9 @@ class Fetcher:
             resp = self.session.head(url, timeout=self.timeout, allow_redirects=True)
         except requests.RequestException as exc:
             result.error = _describe_error(exc)
+            if result.error in ("Request timed out", "Connection refused", "SSL/TLS certificate error") \
+                    or result.error.startswith("DNS lookup failed"):
+                return result  # the host itself is the problem; a GET would fail the same way
         # Many servers mishandle HEAD; retry with GET whenever HEAD did not succeed.
         if resp is None or resp.status_code >= 400:
             if resp is not None:

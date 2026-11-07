@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -224,7 +225,7 @@ async def _audit(context_factory, url: str, config: Config, axe_path: Path | Non
     try:
         await page.goto(url, wait_until="load", timeout=max(config.timeout, 10) * 2000)
         try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
+            await page.wait_for_load_state("networkidle", timeout=2500)
         except Exception:
             pass
         await page.wait_for_timeout(300)
@@ -258,7 +259,7 @@ async def _audit(context_factory, url: str, config: Config, axe_path: Path | Non
     return result
 
 
-async def _run(urls: list[str], config: Config, log: Callable[[str], None]) -> dict[str, BrowserResult]:
+async def _run(urls: list[str], config: Config, log: Callable[[str], None], on_result=None) -> dict[str, BrowserResult]:
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -280,23 +281,47 @@ async def _run(urls: list[str], config: Config, log: Callable[[str], None]) -> d
         async def factory():
             return await browser.new_context(user_agent=config.user_agent, viewport=DESKTOP_VIEWPORT)
 
-        done = 0
-
         async def one(u: str) -> None:
-            nonlocal done
             async with sem:
-                results[u] = await _audit(factory, u, config, axe_path)
-            done += 1
-            if done % 10 == 0 or done == len(urls):
-                log(f"  browser-checked {done}/{len(urls)} pages")
+                started = time.monotonic()
+                results[u] = res = await _audit(factory, u, config, axe_path)
+            if on_result:
+                on_result(u, res, time.monotonic() - started)
 
-        await asyncio.gather(*(one(u) for u in urls))
-        await browser.close()
+        try:
+            await asyncio.gather(*(one(u) for u in urls))
+        finally:
+            await browser.close()
     return results
 
 
-def run_browser_audit(urls: list[str], config: Config, log: Callable[[str], None]) -> dict[str, BrowserResult]:
-    return asyncio.run(_run(urls, config, log))
+def run_browser_audit(urls: list[str], config: Config, log: Callable[[str], None],
+                      on_result: Callable[[str, BrowserResult, float], None] | None = None) -> dict[str, BrowserResult]:
+    """Audit ``urls``; ``on_result(url, result, seconds)`` is called as each page finishes."""
+    return asyncio.run(_run(urls, config, log, on_result))
+
+
+def browser_result_from_dict(d: dict) -> BrowserResult:
+    d = dict(d)
+    d["js_errors"] = [tuple(x) for x in d.get("js_errors", [])]
+    d["failed_requests"] = [tuple(x) for x in d.get("failed_requests", [])]
+    return BrowserResult(**{k: v for k, v in d.items() if k in BrowserResult.__dataclass_fields__})
+
+
+def summarize(br: BrowserResult) -> str:
+    """One-line description of a browser result, for progress output."""
+    if br.error:
+        return f"FAILED {br.error}"
+    parts = []
+    if br.info.get("ttfb") is not None:
+        parts.append(f"server {br.info['ttfb']} ms")
+    for n, label in ((len(br.js_errors), "JS error"), (len(br.failed_requests), "failed request"),
+                     (sum(v["count"] for v in br.axe), "a11y issue"), (sum(c["count"] for c in br.contrast), "low-contrast")):
+        if n:
+            parts.append(f"{n} {label}" + ("s" if n != 1 and not label.endswith("contrast") else ""))
+    if br.mobile.get("scrollWidth", 0) > br.mobile.get("viewport", 10**6) + 1:
+        parts.append("scrolls sideways on mobile")
+    return ", ".join(parts) or "no problems"
 
 
 # ----------------------------------------------------------------------------

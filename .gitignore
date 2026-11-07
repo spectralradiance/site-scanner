@@ -6,3 +6,7 @@ __pycache__/
 *-pages-*.csv
 *.png
 !tests/site/*.png
+.site-scanner/
+*.log
+*.csv.tmp
+reports/

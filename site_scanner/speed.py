@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 import statistics
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urlsplit
@@ -215,10 +216,10 @@ async def _measure_once(browser, url: str, config: Config, profile: dict) -> tup
 
         await page.goto(url, wait_until="load", timeout=90_000)
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            await page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
             pass
-        await page.wait_for_timeout(1500)  # let LCP settle and catch late layout shifts
+        await page.wait_for_timeout(1000)  # let LCP settle and catch late layout shifts
         metrics = await page.evaluate(PERF_COLLECT_JS)
     finally:
         await context.close()
@@ -242,7 +243,7 @@ def _median_metrics(runs: list[dict]) -> dict:
     return out
 
 
-async def _run(urls: list[str], config: Config, log: Callable[[str], None]) -> dict[str, SpeedResult]:
+async def _run(urls: list[str], config: Config, log: Callable[[str], None], on_result=None) -> dict[str, SpeedResult]:
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -252,30 +253,50 @@ async def _run(urls: list[str], config: Config, log: Callable[[str], None]) -> d
     results: dict[str, SpeedResult] = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        for i, url in enumerate(urls, 1):
-            res = SpeedResult(url=url)
-            try:
-                runs_wanted = max(1, config.speed_runs)
-                while len(res.runs) < runs_wanted:
-                    metrics, reqs = await _measure_once(browser, url, config, profile)
-                    res.runs.append(metrics)
-                    if not res.requests:
-                        res.requests = reqs
-                    # A page that looks slow gets re-measured: report the median of 3 runs.
-                    if len(res.runs) == 1 and runs_wanted < 3 and _flagged(metrics):
-                        runs_wanted = 3
-                res.metrics = _median_metrics(res.runs)
-            except Exception as exc:
-                res.error = _short_error(exc)
-            results[url] = res
-            if i % 5 == 0 or i == len(urls):
-                log(f"  speed-tested {i}/{len(urls)} pages")
-        await browser.close()
+        try:
+            for url in urls:
+                started = time.monotonic()
+                res = SpeedResult(url=url)
+                try:
+                    for _ in range(max(1, config.speed_runs)):
+                        metrics, reqs = await _measure_once(browser, url, config, profile)
+                        res.runs.append(metrics)
+                        if not res.requests:
+                            res.requests = reqs
+                    res.metrics = _median_metrics(res.runs)
+                except Exception as exc:
+                    res.error = _short_error(exc)
+                results[url] = res
+                if on_result:
+                    on_result(url, res, time.monotonic() - started)
+        finally:
+            await browser.close()
     return results
 
 
-def run_speed_tests(urls: list[str], config: Config, log: Callable[[str], None]) -> dict[str, SpeedResult]:
-    return asyncio.run(_run(urls, config, log))
+def run_speed_tests(urls: list[str], config: Config, log: Callable[[str], None],
+                    on_result: Callable[[str, SpeedResult, float], None] | None = None) -> dict[str, SpeedResult]:
+    """Measure ``urls`` one at a time; ``on_result(url, result, seconds)`` is called after each."""
+    return asyncio.run(_run(urls, config, log, on_result))
+
+
+def speed_result_from_dict(d: dict) -> SpeedResult:
+    d = dict(d)
+    d["requests"] = [Request(**r) for r in d.get("requests", [])]
+    return SpeedResult(**{k: v for k, v in d.items() if k in SpeedResult.__dataclass_fields__})
+
+
+def summarize(res: SpeedResult) -> str:
+    """One-line description of a speed result, for progress output."""
+    if res.error:
+        return f"FAILED {res.error}"
+    m = res.metrics
+
+    def s(key, scale=1000.0, unit="s", digits=1):
+        v = m.get(key)
+        return "-" if v is None else f"{v / scale:.{digits}f}{unit}"
+    return (f"LCP {s('lcp_ms')}  FCP {s('fcp_ms')}  CLS {m.get('cls', '-')}  TBT {s('tbt_ms', 1, 'ms', 0)}  "
+            f"{_kb((m.get('weight_kb') or 0) * 1024)}, {m.get('requests', 0)} requests")
 
 
 # ----------------------------------------------------------------------------
